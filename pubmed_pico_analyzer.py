@@ -1,16 +1,16 @@
 import time
-import csv
 import pandas as pd
 import google.generativeai as genai
 from google.colab import userdata
 from Bio import Entrez
 from tqdm import tqdm
+import xml.etree.ElementTree as ET
 
 # 상수 정의
 BATCH_SIZE = 200
-SLEEP_INTERVAL = 0.4 # PubMed API 호출 사이의 간격 (초)
-MAX_RETMAX = 10000 # PubMed에서 한 번에 검색할 최대 논문 수
-MIN_ABSTRACT_LENGTH = 50 # 분석을 위한 최소 초록 길이
+SLEEP_INTERVAL = 0.4  # PubMed API 호출 사이의 간격 (초)
+MAX_RETMAX = 10000  # PubMed에서 한 번에 검색할 최대 논문 수
+MIN_ABSTRACT_LENGTH = 50  # 분석을 위한 최소 초록 길이
 
 # Gemini 프롬프트 템플릿
 PROMPT_TEMPLATE = """
@@ -25,63 +25,60 @@ PROMPT_TEMPLATE = """
 확실성 등급 (숫자만):
 """
 
-def parse_medline_records(medline_text):
+def parse_xml_records(pubmed_data):
     """
-    MEDLINE 텍스트를 파싱하여 PMID, 초록, PT, MeSH 정보를 추출합니다.
+    Entrez.read()로 파싱된 PubMed XML 데이터에서 주요 정보를 추출합니다.
+    이 함수는 수동 텍스트 파싱보다 훨씬 안정적입니다.
 
     Args:
-        medline_text (str): PubMed에서 가져온 MEDLINE 형식의 텍스트 데이터.
+        pubmed_data (dict): Entrez.read()로 파싱된 PubMed XML 데이터.
 
     Returns:
         list: 각 논문의 정보를 포함한 딕셔너리 리스트 (pmid, abstract, publication_types, mesh_terms).
     """
     records = []
-    # PMID- 를 기준으로 개별 논문 데이터를 분리합니다.
-    individual_articles = medline_text.strip().split("PMID- ")
-
-    for article_text in individual_articles:
-        if not article_text.strip():
+    for article_data in pubmed_data.get('PubmedArticle', []):
+        medline_citation = article_data.get('MedlineCitation', {})
+        if not medline_citation:
             continue
 
-        pmid, abstract = "", ""
-        pub_types, mesh_terms = [], []
+        pmid = str(medline_citation.get('PMID', ''))
+        article = medline_citation.get('Article', {})
 
-        lines = article_text.strip().split("\n")
-        if not lines:
-            continue
+        # 구조화된 초록(Abstract) 처리
+        abstract_element = article.get('Abstract', {}).get('AbstractText', [])
+        if isinstance(abstract_element, list):
+            abstract_parts = []
+            for part in abstract_element:
+                label = part.attributes.get('Label', '')
+                text = str(part)
+                if label:
+                    abstract_parts.append(f"{label}: {text}")
+                else:
+                    abstract_parts.append(text)
+            abstract = " ".join(abstract_parts)
+        else:
+            abstract = str(abstract_element)
 
-        pmid = lines[0].strip()
+        # 출판 유형(Publication Types) 처리
+        pub_type_list = article.get('PublicationTypeList', [])
+        publication_types = "; ".join([str(pt) for pt in pub_type_list])
 
-        is_abstract_section = False
-        abstract_lines = []
-
-        for line in lines:
-            # 'AB  - '로 시작하는 줄은 초록의 시작입니다.
-            if line.startswith("AB  - "):
-                is_abstract_section = True
-                abstract_lines.append(line[6:].strip())
-            # 초록 섹션이 계속되는 경우 (들여쓰기 된 줄)
-            elif is_abstract_section and line.startswith("      "):
-                abstract_lines.append(line[6:].strip())
-            else:
-                is_abstract_section = False
-
-            if line.startswith("PT  - "):
-                pub_types.append(line[6:].strip())
-
-            if line.startswith("MH  - "):
-                mesh_terms.append(line[6:].strip())
-
-        if abstract_lines:
-            abstract = " ".join(abstract_lines)
+        # MeSH 용어(MeSH Terms) 처리
+        mesh_heading_list = medline_citation.get('MeshHeadingList', [])
+        mesh_terms_list = []
+        for mesh_heading in mesh_heading_list:
+            descriptor = mesh_heading.get('DescriptorName')
+            if descriptor:
+                mesh_terms_list.append(str(descriptor))
+        mesh_terms = "; ".join(mesh_terms_list)
 
         records.append({
             "pmid": pmid,
             "abstract": abstract or "No Abstract Found",
-            "publication_types": "; ".join(pub_types),
-            "mesh_terms": "; ".join(mesh_terms)
+            "publication_types": publication_types,
+            "mesh_terms": mesh_terms
         })
-
     return records
 
 def get_pico_input():
@@ -104,7 +101,7 @@ def get_pico_input():
         outcome = input("4. Outcome (결과): ")
     return population, intervention, control, outcome
 
-def analyze_abstract_with_gemini(model, abstract, p, i, c, o):
+def analyze_abstract_with_gemini(model, abstract, p, i, c, o, pmid):
     """
     Gemini API를 사용하여 초록을 분석하고 PICO 기준에 따른 확실성 점수와 토큰 수를 반환합니다.
 
@@ -115,6 +112,7 @@ def analyze_abstract_with_gemini(model, abstract, p, i, c, o):
         i (str): Intervention.
         c (str): Control.
         o (str): Outcome.
+        pmid (str): 로깅을 위한 PubMed ID.
 
     Returns:
         tuple: (certainty_score, token_count)
@@ -124,18 +122,16 @@ def analyze_abstract_with_gemini(model, abstract, p, i, c, o):
         response = model.generate_content(prompt)
         response_text = response.text.strip()
 
-        # 응답이 숫자인지, 그리고 1-5 범위 내에 있는지 확인합니다.
         if response_text.isdigit() and 1 <= int(response_text) <= 5:
             certainty = int(response_text)
         else:
-            # 유효하지 않은 응답일 경우, 로그를 남기고 0을 반환합니다.
-            tqdm.write(f"   - Gemini API 응답 오류: 유효하지 않은 값 '{response_text}'")
+            tqdm.write(f"   - Gemini API 응답 오류: 유효하지 않은 값 '{response_text}' (PMID: {pmid})")
             return 0, 0
 
         tokens = model.count_tokens(prompt).total_tokens
         return certainty, tokens
     except Exception as e:
-        tqdm.write(f"   - Gemini API 오류: {e}")
+        tqdm.write(f"   - Gemini API 오류: {e} (PMID: {pmid})")
         return 0, 0
 
 def analyze_row(row, model, p, i, c, o):
@@ -154,13 +150,13 @@ def analyze_row(row, model, p, i, c, o):
         tuple or None: (확실성 점수, 토큰 수) 또는 None.
     """
     abstract = row.get("abstract", "")
-    # 초록이 비어있거나 너무 짧으면 분석을 건너뜁니다.
-    # "No Abstract Found" 또는 의미 없는 짧은 문자열을 걸러내기 위함입니다.
+    pmid = row.get("pmid", "N/A")
+
     if pd.isna(abstract) or len(str(abstract)) < MIN_ABSTRACT_LENGTH:
-        tqdm.write(f"   - 초록 내용이 짧거나 없어 건너뜁니다 (PMID: {row['pmid']}).")
+        tqdm.write(f"   - 초록 내용이 짧거나 없어 건너뜁니다 (PMID: {pmid}).")
         return None
 
-    return analyze_abstract_with_gemini(model, abstract, p, i, c, o)
+    return analyze_abstract_with_gemini(model, abstract, p, i, c, o, pmid)
 
 def main():
     """
@@ -169,7 +165,6 @@ def main():
     # --- 1. PubMed API 설정 및 검색어 입력 ---
     print("--- PubMed 논문 검색 및 PICO 분석 도구 ---")
 
-    # 사용자에게 이메일 주소 입력을 요청 (PubMed API 정책)
     email = ""
     while not email:
         email = input("PubMed API 사용을 위해 이메일 주소를 입력해주세요: ")
@@ -194,25 +189,32 @@ def main():
         print("검색된 논문이 없습니다.")
         return
 
-    print(f"총 {count}개의 논문을 찾았습니다. MEDLINE 데이터를 다운로드합니다.")
+    fetch_count = count
+    if count > MAX_RETMAX:
+        print(f"\n경고: 총 검색 결과 {count}개가 최대 다운로드 개수 {MAX_RETMAX}개를 초과합니다.")
+        print(f"상위 {MAX_RETMAX}개의 논문만 다운로드하여 분석합니다.")
+        fetch_count = MAX_RETMAX
 
-    # --- 2. EFetch로 데이터 추출 ---
+    print(f"\n총 {count}개의 논문을 찾았습니다. 이 중 {fetch_count}개를 다운로드합니다.")
+
+    # --- 2. EFetch로 데이터 추출 (XML 형식 사용) ---
     all_pubmed_records = []
-    with tqdm(total=count, desc="데이터 다운로드 중") as pbar:
-        for start in range(0, count, BATCH_SIZE):
+    with tqdm(total=fetch_count, desc="데이터 다운로드 중") as pbar:
+        for start in range(0, fetch_count, BATCH_SIZE):
             try:
                 fetch_handle = Entrez.efetch(
-                    db="pubmed", rettype="medline", retmode="text", retstart=start,
+                    db="pubmed", rettype="abstract", retmode="xml", retstart=start,
                     retmax=BATCH_SIZE, webenv=search_results["WebEnv"], query_key=search_results["QueryKey"]
                 )
-                medline_data = fetch_handle.read()
+                pubmed_data = Entrez.read(fetch_handle)
                 fetch_handle.close()
-                parsed_records = parse_medline_records(medline_data)
+
+                parsed_records = parse_xml_records(pubmed_data)
                 all_pubmed_records.extend(parsed_records)
                 pbar.update(len(parsed_records))
                 time.sleep(SLEEP_INTERVAL)
             except Exception as e:
-                print(f"\n데이터 추출 중 오류 발생 (PMID {start+1}부터): {e}")
+                print(f"\n데이터 추출 중 오류 발생 (기록 {start+1}부터): {e}")
                 continue
 
     df = pd.DataFrame(all_pubmed_records)
@@ -233,30 +235,26 @@ def main():
     p, i, c, o = get_pico_input()
 
     # --- 4. Gemini API로 초록 분석 ---
-    certainty_scores = []
+    results = []
     total_tokens, analyzed_count = 0, 0
     print("\nGemini API를 사용하여 논문 초록 분석을 시작합니다...")
 
-    # tqdm을 사용하여 진행 상황 표시
     for _, row in tqdm(df.iterrows(), total=len(df), desc="논문 분석 중"):
         analysis_result = analyze_row(row, model, p, i, c, o)
 
+        certainty = None
         if analysis_result:
-            certainty, tokens = analysis_result
-            if certainty > 0:
-                certainty_scores.append(certainty)
+            score, tokens = analysis_result
+            if score > 0:
+                certainty = score
                 total_tokens += tokens
                 analyzed_count += 1
-            else:
-                certainty_scores.append(None) # API 오류 또는 유효하지 않은 응답
-        else:
-            certainty_scores.append(None) # 분석 건너뜀
 
-        # Gemini API의 분당 요청 제한(기본 60 QPM)을 준수하기 위해 1초 대기
+        results.append(certainty)
         time.sleep(1)
 
     # --- 5. 최종 결과를 CSV 파일로 저장 ---
-    df['certainty'] = certainty_scores
+    df['certainty'] = results
     output_filename = "pubmed_pico_analysis.csv"
     try:
         df.to_csv(output_filename, index=False, encoding='utf-8-sig')

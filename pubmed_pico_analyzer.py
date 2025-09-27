@@ -1,7 +1,7 @@
 import time
 import pandas as pd
 import google.generativeai as genai
-from google.colab import userdata
+import os
 from Bio import Entrez
 from tqdm import tqdm
 import xml.etree.ElementTree as ET
@@ -222,12 +222,12 @@ def main():
 
     # --- 3. Gemini API 설정 및 PICO 입력 ---
     try:
-        api_key = userdata.get('GOOGLE_API_KEY')
+        api_key = os.environ.get('GOOGLE_API_KEY')
         if not api_key:
-            print("오류: Colab의 Secrets에 'GOOGLE_API_KEY'를 설정해주세요.")
+            print("오류: 'GOOGLE_API_KEY' 환경 변수를 설정해주세요.")
             return
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-pro')
     except Exception as e:
         print(f"Gemini API 설정 중 오류 발생: {e}")
         return

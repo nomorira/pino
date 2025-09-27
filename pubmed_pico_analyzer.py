@@ -169,7 +169,7 @@ def main():
     while not email:
         email = input("PubMed API 사용을 위해 이메일 주소를 입력해주세요: ")
     Entrez.email = email
-    Entrez.api_key = userdata.get('PUBMED_API_KEY', None)
+    # Entrez.api_key = userdata.get('PUBMED_API_KEY', None) # API 키 없이 사용
 
     keyword = input("검색할 키워드를 입력하세요: ")
     year = input("검색할 출판 연도를 입력하세요 (예: 2023): ")
